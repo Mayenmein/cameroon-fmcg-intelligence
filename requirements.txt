@@ -1,0 +1,8 @@
+pydantic
+sqlalchemy
+psycopg2-binary
+pandas
+pyarrow
+pytest
+black
+ruff
