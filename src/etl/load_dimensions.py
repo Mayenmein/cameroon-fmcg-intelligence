@@ -58,6 +58,7 @@ def main():
     load_parquet(settings.data_processed_dir / "dim_region.parquet", "dim_region", if_exists="replace")
     load_parquet(settings.data_processed_dir / "dim_market.parquet", "dim_market", if_exists="replace")
     load_parquet(settings.data_processed_dir / "dim_product.parquet", "dim_product", if_exists="replace")
+    load_parquet(settings.data_processed_dir / "dim_customer.parquet", "dim_customer", if_exists="replace")
     
     # 3. Confirm
     print("\nRow counts:")
@@ -65,6 +66,7 @@ def main():
     print(f"  dim_region: {row_count('dim_region'):,}")
     print(f"  dim_market: {row_count('dim_market'):,}")
     print(f"  dim_product: {row_count('dim_product'):,}")
+    print(f"  dim_customer: {row_count('dim_customer'):,}")
 
 
 if __name__ == "__main__":

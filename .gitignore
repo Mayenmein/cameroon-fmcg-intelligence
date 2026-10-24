@@ -3,7 +3,10 @@ __pycache__/
 .env
 .venv/
 venv/
-data/raw/
+data/raw/comtrade
+data/raw/wfp
+data/raw/gadm
+data/raw/enterprise_survey
 data/interim/
 data/processed/
 logs/*.log

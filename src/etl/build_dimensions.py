@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from src.config.settings import settings
-from src.config.constants import PRODUCT_CATEGORIES, EXCLUDE, DROP_FAO_DUPLICATES, REGION_WEIGHTS
+from src.config.constants import PRODUCT_CATEGORIES, EXCLUDE, DROP_FAO_DUPLICATES
 
 def build_dim_date(start: str = "2005-01-01", end: str = "2026-12-31") -> pd.DataFrame:
     """Generate a daily calendar dimension."""
@@ -120,32 +120,98 @@ def build_dim_product() -> pd.DataFrame:
     print(f"dim_product: {len(df)} rows -> {out}")
     return df
 
+
 def build_dim_customer(n: int = 500, seed: int = 42) -> pd.DataFrame:
-    """Build 500 distributors, each anchored to a real market."""
+    """Generate synthetic customers assigned to markets.
+
+    Regional allocation uses population as a documented proxy.
+    Markets are sampled uniformly within each selected region.
+    Customer-type proportions are simulation assumptions, not
+    observed estimates of Cameroon distributor composition.
+    """
+    if n <= 0:
+        raise ValueError("n must be greater than zero.")
+
     rng = np.random.default_rng(seed)
-    dim_market = pd.read_parquet(settings.data_processed_dir / "dim_market.parquet")
 
-    # Weight markets by region size so Douala and Yaoundé carry more distributors.
-    region_weights = {1: 0.22, 2: 0.20, 3: 0.10, 4: 0.09, 5: 0.08,
-                      6: 0.08, 7: 0.07, 8: 0.06, 9: 0.05, 10: 0.05}
-    market_weights = dim_market["region_id"].map(region_weights).to_numpy(dtype=float)
-    market_probs = market_weights / market_weights.sum()
-
-    sampled_markets = rng.choice(
-        dim_market["market_id"].to_numpy(), size=n, p=market_probs,
+    dim_market = pd.read_parquet(
+        settings.data_processed_dir / "dim_market.parquet"
     )
+    dim_region = pd.read_parquet(
+        settings.data_processed_dir / "dim_region.parquet"
+    )
+
+    required_market = {"market_id", "region_id"}
+    required_region = {"region_id", "population"}
+
+    if not required_market.issubset(dim_market.columns):
+        raise ValueError("dim_market is missing required columns.")
+
+    if not required_region.issubset(dim_region.columns):
+        raise ValueError(
+            "dim_region must contain region_id and population."
+        )
+
+    if dim_market["market_id"].duplicated().any():
+        raise ValueError("market_id must be unique in dim_market.")
+
+    # Only allocate customers to regions that have markets.
+    available_regions = dim_region[
+        dim_region["region_id"].isin(dim_market["region_id"])
+    ].copy()
+
+    if available_regions.empty:
+        raise ValueError("No regions have matching market records.")
+
+    if (
+        available_regions["population"].isna().any()
+        or (available_regions["population"] <= 0).any()
+    ):
+        raise ValueError(
+            "Available regions must have positive, non-missing population."
+        )
+
+    # Population-based regional allocation: a proxy, not observed
+    # distributor counts or measured product demand.
+    region_ids = available_regions["region_id"].to_numpy()
+    region_probs = (
+        available_regions["population"].to_numpy(dtype=float)
+    )
+    region_probs /= region_probs.sum()
+
+    sampled_regions = rng.choice(
+        region_ids, size=n, p=region_probs
+    )
+
+    # Sample a market within each customer's assigned region.
+    markets_by_region = {
+        region_id: group["market_id"].to_numpy()
+        for region_id, group in dim_market.groupby("region_id")
+    }
+
+    sampled_markets = np.empty(n, dtype=dim_market["market_id"].dtype)
+
+    for region_id in np.unique(sampled_regions):
+        mask = sampled_regions == region_id
+        market_ids = markets_by_region[region_id]
+        sampled_markets[mask] = rng.choice(
+            market_ids, size=mask.sum(), replace=True
+        )
+
     customer_types = ["supermarket", "wholesaler", "retailer", "kiosk"]
     type_probs = [0.10, 0.30, 0.45, 0.15]
 
     df = pd.DataFrame({
-        "customer_id": range(1, n + 1),
-        "customer_type": rng.choice(customer_types, size=n, p=type_probs),
+        "customer_id": np.arange(1, n + 1),
+        "customer_type": rng.choice(
+            customer_types, size=n, p=type_probs
+        ),
+        "region_id": sampled_regions,
         "market_id": sampled_markets,
     })
-    df = df.merge(dim_market[["market_id", "region_id"]], on="market_id")
-    df = df[["customer_id", "customer_type", "region_id", "market_id"]]
 
     out = settings.data_processed_dir / "dim_customer.parquet"
     df.to_parquet(out, index=False)
+
     print(f"dim_customer: {len(df)} rows -> {out}")
     return df

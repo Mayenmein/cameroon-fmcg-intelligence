@@ -1,893 +1,363 @@
 
-from __future__ import annotations
+import json
+from pathlib import Path
 
-from typing import Optional
-
-import numpy as np
 import pandas as pd
-from scipy.stats import nbinom
+import simpy
+import numpy as np
+from src.config.settings import Settings
 
 
-class CameroonianDemandSimulator:
-    """
-    Hierarchical synthetic sales simulator.
+ROOT = Path(__file__).resolve().parents[2]
+PROCESSED = Settings().data_processed_dir
+CONFIG_PATH = ROOT / "src/config" / "inventory_scenario.json"
+OUTPUT_DIR = PROCESSED / "inventory_full_run_revised1"
 
-    Required quantity convention:
-        fact_trade.import_quantity and fact_sales.quantity must use
-        the same physical unit. Sales quantities are integer units.
 
-    The national constraint is an import-based supply proxy, not a
-    complete national food-balance model.
+def load_config(products):
+    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+        config = json.load(f)
 
-    If fact_market_price has market_id, prices are matched by market.
-    Otherwise, product-year-month prices are used as a documented
-    fallback.
+    settings = config["products"]
+    actual_names = set(products["product_name"])
+    configured_names = set(settings)
 
-    Regional and market weights are assumptions unless estimated
-    from reliable external data.
-    """
-
-    REQUIRED_CUSTOMER = {
-        "customer_id", "region_id", "market_id", "customer_type"
-    }
-    REQUIRED_MARKET = {"market_id", "region_id"}
-    REQUIRED_PRICE = {"product_id", "date_id", "price"}
-    REQUIRED_TRADE = {"product_id", "import_quantity"}
-    REQUIRED_PRODUCT = {"product_id"}
-
-    CHANNEL_MULTIPLIERS = {
-        "wholesaler": 3.0,
-        "supermarket": 2.0,
-        "retailer": 1.0,
-        "kiosk": 0.4,
-    }
-    DISCOUNTS = {
-        "wholesaler": 0.10,
-        "supermarket": 0.05,
-        "retailer": 0.02,
-        "kiosk": 0.00,
-    }
-
-    def __init__(
-        self,
-        dim_customer: pd.DataFrame,
-        dim_product: pd.DataFrame,
-        dim_region: pd.DataFrame,
-        dim_market: pd.DataFrame,
-        fact_market_price: pd.DataFrame,
-        fact_trade: pd.DataFrame,
-        *,
-        region_weights: Optional[dict] = None,
-        market_weights: Optional[dict] = None,
-        seasonal_weights: Optional[dict] = None,
-        price_elasticity: float = -0.75,
-        base_transactions_per_batch: float = 15.0,
-        base_transaction_mean: float = 15.0,
-        random_state: int = 42,
-    ):
-        self.dim_customer = dim_customer.copy()
-        self.dim_product = dim_product.copy()
-        self.dim_region = dim_region.copy()
-        self.dim_market = dim_market.copy()
-        self.fact_market_price = fact_market_price.copy()
-        self.fact_trade = fact_trade.copy()
-
-        self.region_weights = region_weights
-        self.market_weights = market_weights
-        self.seasonal_weights = seasonal_weights
-
-        if price_elasticity > 0:
-            raise ValueError(
-                "price_elasticity must be <= 0 for the "
-                "assumed downward-sloping demand model."
-            )
-        if base_transactions_per_batch <= 0:
-            raise ValueError("base_transactions_per_batch must be positive.")
-        if base_transaction_mean <= 0:
-            raise ValueError("base_transaction_mean must be positive.")
-
-        self.price_elasticity = float(price_elasticity)
-        self.base_transactions_per_batch = float(
-            base_transactions_per_batch
-        )
-        self.base_transaction_mean = float(base_transaction_mean)
-        self.rng = np.random.default_rng(random_state)
-
-        self.national_supply = None
-        self.regional_monthly_targets = None
-        self.market_targets = None
-        self.sales_targets = None
-        self._price_table = None
-
-        self._validate_inputs()
-
-    # ---------------------------------------------------------------
-    # General validation and utilities
-    # ---------------------------------------------------------------
-
-    @staticmethod
-    def _require_columns(df, columns, name):
-        missing = set(columns) - set(df.columns)
-        if missing:
-            raise ValueError(
-                f"{name} is missing required columns: {sorted(missing)}"
-            )
-
-    @staticmethod
-    def _check_unique(df, columns, name):
-        if df.duplicated(columns).any():
-            raise ValueError(
-                f"{name} contains duplicate keys: {columns}"
-            )
-
-    @staticmethod
-    def _year_month(series, name):
-        """
-        Accept YYYYMMDD integer/string date keys or date-like values.
-        Returns integer year and month.
-        """
-        values = series.astype("string").str.strip()
-        compact = values.str.fullmatch(r"\d{8}", na=False)
-
-        parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
-
-        if compact.any():
-            parsed.loc[compact] = pd.to_datetime(
-                values.loc[compact],
-                format="%Y%m%d",
-                errors="coerce",
-            )
-
-        if (~compact).any():
-            parsed.loc[~compact] = pd.to_datetime(
-                series.loc[~compact],
-                errors="coerce",
-            )
-
-        if parsed.isna().any():
-            bad = series.loc[parsed.isna()].head(5).tolist()
-            raise ValueError(
-                f"Cannot parse {name} as dates. Examples: {bad}"
-            )
-
-        return parsed.dt.year.astype(int), parsed.dt.month.astype(int)
-
-    def _validate_inputs(self):
-        self._require_columns(
-            self.dim_customer, self.REQUIRED_CUSTOMER, "dim_customer"
-        )
-        self._require_columns(
-            self.dim_product, self.REQUIRED_PRODUCT, "dim_product"
-        )
-        self._require_columns(
-            self.dim_region, {"region_id"}, "dim_region"
-        )
-        self._require_columns(
-            self.dim_market, self.REQUIRED_MARKET, "dim_market"
-        )
-        self._require_columns(
-            self.fact_market_price, self.REQUIRED_PRICE, "fact_market_price"
-        )
-        self._require_columns(
-            self.fact_trade, self.REQUIRED_TRADE, "fact_trade"
+    if actual_names != configured_names:
+        raise ValueError(
+            f"Product configuration mismatch. "
+            f"Missing: {sorted(actual_names - configured_names)}; "
+            f"unknown: {sorted(configured_names - actual_names)}"
         )
 
-        for df, key, name in [
-            (self.dim_customer, "customer_id", "dim_customer"),
-            (self.dim_product, "product_id", "dim_product"),
-            (self.dim_region, "region_id", "dim_region"),
-            (self.dim_market, "market_id", "dim_market"),
-        ]:
-            if df[key].isna().any():
-                raise ValueError(f"{name}.{key} contains null keys.")
-
-        self._check_unique(self.dim_customer, ["customer_id"], "dim_customer")
-        self._check_unique(self.dim_product, ["product_id"], "dim_product")
-        self._check_unique(self.dim_region, ["region_id"], "dim_region")
-        self._check_unique(self.dim_market, ["market_id"], "dim_market")
-
-        if self.dim_region.empty or self.dim_market.empty:
-            raise ValueError("Region and market dimensions cannot be empty.")
-        if self.dim_customer.empty or self.dim_product.empty:
-            raise ValueError("Customer and product dimensions cannot be empty.")
-
-        known_regions = set(self.dim_region["region_id"])
-        if not set(self.dim_market["region_id"]).issubset(known_regions):
-            raise ValueError("dim_market contains unknown region_id values.")
-
-        customer_markets = self.dim_customer.merge(
-            self.dim_market[["market_id", "region_id"]],
-            on="market_id",
-            how="left",
-            suffixes=("_customer", "_market"),
-            validate="many_to_one",
-            indicator=True,
-        )
-        if (customer_markets["_merge"] != "both").any():
-            raise ValueError("Some customers reference unknown markets.")
-
-        if (
-            customer_markets["region_id_customer"]
-            != customer_markets["region_id_market"]
-        ).any():
-            raise ValueError(
-                "Some customers have a region_id inconsistent "
-                "with their market's region."
-            )
-
-        trade = self.fact_trade
-        if "year" in trade.columns:
-            years = pd.to_numeric(trade["year"], errors="coerce")
-            if years.isna().any() or (years % 1 != 0).any():
-                raise ValueError("fact_trade.year must contain integer years.")
-            trade_year = years.astype(int)
-        elif "date_id" in trade.columns:
-            trade_year, _ = self._year_month(
-                trade["date_id"], "fact_trade.date_id"
-            )
-        else:
-            raise ValueError(
-                "fact_trade must contain either 'year' or 'date_id'."
-            )
-
-        quantities = pd.to_numeric(
-            trade["import_quantity"], errors="coerce"
-        )
-        if quantities.isna().any() or not np.isfinite(quantities).all():
-            raise ValueError("Trade quantities must be finite numeric values.")
-        if (quantities < 0).any():
-            raise ValueError("Trade quantities cannot be negative.")
-
-        # Store normalized trade data for Stage 1.
-        self._trade_clean = trade.copy()
-        self._trade_clean["trade_year"] = trade_year.to_numpy()
-        self._trade_clean["import_quantity"] = quantities.to_numpy()
-
-        prices = self.fact_market_price.copy()
-        prices["price"] = pd.to_numeric(prices["price"], errors="coerce")
-        if prices["price"].isna().any() or not np.isfinite(
-            prices["price"]
-        ).all():
-            raise ValueError("Market prices must be finite numeric values.")
-        if (prices["price"] <= 0).any():
-            raise ValueError("Market prices must be strictly positive.")
-
-        prices["year"], prices["month"] = self._year_month(
-            prices["date_id"], "fact_market_price.date_id"
-        )
-        self._price_table = prices
-
-        if "market_id" in prices.columns:
-            if not set(prices["market_id"]).issubset(
-                set(self.dim_market["market_id"])
-            ):
-                raise ValueError(
-                    "Price table contains market_id values absent "
-                    "from dim_market."
-                )
-
-        if not set(self._trade_clean["product_id"]).issubset(
-            set(self.dim_product["product_id"])
+    for name, p in settings.items():
+        if not (
+            0 <= p["reorder_point"] < p["order_up_to"]
+            and 0 <= p["opening_stock"]
+            and p["lead_time_days"] >= 1
         ):
-            raise ValueError(
-                "Trade data contains product IDs absent from dim_product."
-            )
-        if not set(prices["product_id"]).issubset(
-            set(self.dim_product["product_id"])
-        ):
-            raise ValueError(
-                "Price data contains product IDs absent from dim_product."
-            )
+            raise ValueError(f"Invalid inventory parameters for {name}")
 
-    @staticmethod
-    def _allocate_integer(total, weights):
-        """
-        Largest-remainder allocation.
+    return config
 
-        Returns nonnegative integers whose sum is exactly `total`.
-        """
-        total = int(total)
-        weights = np.asarray(weights, dtype=float)
 
-        if total < 0:
-            raise ValueError("Allocation total cannot be negative.")
-        if len(weights) == 0:
-            if total:
-                raise ValueError("Cannot allocate a positive total to no rows.")
-            return np.zeros(0, dtype=int)
-        if not np.isfinite(weights).all() or (weights < 0).any():
-            raise ValueError("Allocation weights must be finite and nonnegative.")
+def run_inventory_simulation():
+    demand = pd.read_parquet(PROCESSED / "sim_demand.parquet")
+    products = pd.read_parquet(PROCESSED / "dim_product.parquet")
 
-        if total == 0:
-            return np.zeros(len(weights), dtype=int)
+    demand["date"] = pd.to_datetime(demand["date"]).dt.normalize()
 
-        if weights.sum() <= 0:
-            weights = np.ones(len(weights), dtype=float)
+    if demand["demand_qty"].isna().any() or (demand["demand_qty"] < 0).any():
+        raise ValueError("Demand contains missing or negative quantities.")
 
-        exact = total * weights / weights.sum()
-        result = np.floor(exact).astype(int)
-        remainder = total - int(result.sum())
+    if not np.all(demand["demand_qty"] == demand["demand_qty"].astype(int)):
+        raise ValueError("This simulator expects integer demand quantities.")
 
-        if remainder:
-            order = np.argsort(-(exact - result), kind="stable")
-            result[order[:remainder]] += 1
+    config = load_config(products)
+    rng = np.random.default_rng(config["seed"])
 
-        assert int(result.sum()) == total
-        return result
+    product_names = products.set_index("product_id")["product_name"].to_dict()
+    product_ids = list(product_names)
+    product_config = {
+        pid: config["products"][product_names[pid]]
+        for pid in product_ids
+    }
 
-    @staticmethod
-    def _weights_for_ids(ids, configured_weights, key_name):
-        if configured_weights is None:
-            return np.ones(len(ids), dtype=float)
+    dates = sorted(demand["date"].unique())
+    if not dates:
+        raise ValueError("Demand dataset contains no dates.")
 
-        weights = np.array(
-            [float(configured_weights.get(key, 0.0)) for key in ids],
-            dtype=float,
-        )
-        if (
-            not np.isfinite(weights).all()
-            or (weights < 0).any()
-            or weights.sum() <= 0
-        ):
-            raise ValueError(
-                f"Invalid {key_name}: weights must be finite, "
-                "nonnegative and sum to a positive value."
-            )
-        return weights
+    # Verify one row per customer-product-day.
+    key = ["date", "customer_id", "product_id"]
+    if demand.duplicated(key).any():
+        raise ValueError("Duplicate customer-product-day demand records.")
 
-    # ---------------------------------------------------------------
-    # Stage 1: national import-based supply caps
-    # ---------------------------------------------------------------
+    # Pre-group once to avoid rescanning millions of rows each day.
+    demand_by_date = {
+        pd.Timestamp(date): frame
+        for date, frame in demand.groupby("date", sort=True)
+    }
 
-    def stage_1_national_supply_bounds(self):
-        trade = self._trade_clean
+    env = simpy.Environment()
+    stock = {
+        pid: product_config[pid]["opening_stock"]
+        for pid in product_ids
+    }
+    on_order = {pid: 0 for pid in product_ids}
+    scheduled_arrivals = {}
 
-        supply = (
-            trade.groupby(["product_id", "trade_year"], as_index=False)
-            ["import_quantity"]
-            .sum()
-            .rename(
-                columns={
-                    "trade_year": "year",
-                    "import_quantity": "national_supply_cap",
-                }
-            )
-        )
+    sales_rows = []
+    stockout_rows = []
+    snapshot_rows = []
+    order_rows = []
+    delivery_rows = []
+    movement_rows = []
 
-        # Sales quantities are integer units. Floor caps to avoid
-        # claiming more integer units than the source quantity supports.
-        supply["national_supply_cap"] = np.floor(
-            supply["national_supply_cap"] + 1e-10
-        ).astype("int64")
+    order_id = 0
 
-        self.national_supply = supply
-        return supply.copy()
+    # Record initial stock as the opening movement.
+    first_date = pd.Timestamp(dates[0])
+    for pid in product_ids:
+        movement_rows.append({
+            "date": first_date,
+            "product_id": pid,
+            "movement_type": "opening_balance",
+            "quantity_change": stock[pid],
+            "reference_id": None,
+            "on_hand_after": stock[pid],
+        })
 
-    # ---------------------------------------------------------------
-    # Stage 2: allocate national supply to regions, then months
-    # ---------------------------------------------------------------
+    def process_days():
+        nonlocal order_id
 
-    def stage_2_regional_monthly_allocation(self):
-        if self.national_supply is None:
-            self.stage_1_national_supply_bounds()
+        for day_idx, raw_date in enumerate(dates):
+            date = pd.Timestamp(raw_date)
 
-        regions = self.dim_region[["region_id"]].copy()
-        region_ids = regions["region_id"].tolist()
-        region_weights = self._weights_for_ids(
-            region_ids, self.region_weights, "region_weights"
-        )
+            # Opening stock is measured before today's receipts.
+            opening = stock.copy()
 
-        seasonal = self.seasonal_weights or {
-            month: 1.0 for month in range(1, 13)
-        }
-        month_ids = list(range(1, 13))
-        month_weights = self._weights_for_ids(
-            month_ids, seasonal, "seasonal_weights"
-        )
+            arrivals_today = scheduled_arrivals.pop(day_idx, [])
+            received = {pid: 0 for pid in product_ids}
 
-        records = []
-        for supply in self.national_supply.itertuples(index=False):
-            region_totals = self._allocate_integer(
-                supply.national_supply_cap, region_weights
-            )
+            # 1. Receive deliveries due today.
+            for order in arrivals_today:
+                pid = order["product_id"]
+                qty = order["quantity"]
 
-            for region_id, region_total in zip(region_ids, region_totals):
-                monthly_totals = self._allocate_integer(
-                    region_total, month_weights
-                )
-                for month, target in zip(month_ids, monthly_totals):
-                    records.append({
-                        "product_id": supply.product_id,
-                        "year": int(supply.year),
-                        "region_id": region_id,
-                        "month": month,
-                        "regional_monthly_target": int(target),
+                stock[pid] += qty
+                on_order[pid] -= qty
+                received[pid] += qty
+
+                delivery_rows.append({
+                    "order_id": order["order_id"],
+                    "product_id": pid,
+                    "arrival_date": date,
+                    "quantity_received": qty,
+                })
+
+                movement_rows.append({
+                    "date": date,
+                    "product_id": pid,
+                    "movement_type": "receipt",
+                    "quantity_change": qty,
+                    "reference_id": order["order_id"],
+                    "on_hand_after": stock[pid],
+                })
+
+            # 2. Fulfil customer demand in a seeded random order.
+            today = demand_by_date[date]
+            today = today.iloc[rng.permutation(len(today))]
+
+            daily_demand = {pid: 0 for pid in product_ids}
+            daily_sales = {pid: 0 for pid in product_ids}
+            daily_lost = {pid: 0 for pid in product_ids}
+
+            for row in today.itertuples(index=False):
+                pid = row.product_id
+                requested = int(row.demand_qty)
+                sold = min(requested, stock[pid])
+                lost = requested - sold
+
+                stock[pid] -= sold
+                daily_demand[pid] += requested
+                daily_sales[pid] += sold
+                daily_lost[pid] += lost
+
+                sales_rows.append({
+                    "date": date,
+                    "date_id": int(row.date_id),
+                    "customer_id": row.customer_id,
+                    "product_id": pid,
+                    "product_name": product_names[pid],
+                    "demand_qty": requested,
+                    "sales_qty": sold,
+                    "lost_sales_qty": lost,
+                })
+
+                if sold:
+                    movement_rows.append({
+                        "date": date,
+                        "product_id": pid,
+                        "movement_type": "sale",
+                        "quantity_change": -sold,
+                        "reference_id": None,
+                        "on_hand_after": stock[pid],
                     })
 
-        result = pd.DataFrame(records)
-        self.regional_monthly_targets = result
+                if lost:
+                    stockout_rows.append({
+                        "date": date,
+                        "customer_id": row.customer_id,
+                        "product_id": pid,
+                        "demand_qty": requested,
+                        "fulfilled_qty": sold,
+                        "lost_sales_qty": lost,
+                    })
 
-        # Hard check: monthly/regional allocation conserves national supply.
-        check = (
-            result.groupby(["product_id", "year"])
-            ["regional_monthly_target"].sum()
-        )
-        expected = self.national_supply.set_index(
-            ["product_id", "year"]
-        )["national_supply_cap"]
+            # 3. Reorder based on stock plus outstanding orders.
+            for pid in product_ids:
+                p = product_config[pid]
+                position = stock[pid] + on_order[pid]
 
-        if not check.reindex(expected.index, fill_value=0).equals(expected):
-            raise AssertionError(
-                "Regional/monthly allocation does not conserve national supply."
-            )
+                if position <= p["reorder_point"]:
+                    qty = p["order_up_to"] - position
 
-        return result.copy()
+                    if qty > 0:
+                        order_id += 1
+                        lead = p["lead_time_days"]
+                        arrival_idx = day_idx + lead
 
-    # ---------------------------------------------------------------
-    # Stage 3: allocate regional-monthly ceilings to markets
-    # ---------------------------------------------------------------
+                        # If arrival falls beyond the horizon, it remains
+                        # outstanding and is not added to on-hand stock.
+                        if arrival_idx < len(dates):
+                            arrival_date = pd.Timestamp(dates[arrival_idx])
+                        else:
+                            arrival_date = (
+                                date + pd.Timedelta(days=lead)
+                            )
 
-    def stage_3_market_disaggregation(self):
-        if self.regional_monthly_targets is None:
-            self.stage_2_regional_monthly_allocation()
+                        order = {
+                            "order_id": order_id,
+                            "order_date": date,
+                            "arrival_date": arrival_date,
+                            "arrival_day_idx": arrival_idx,
+                            "product_id": pid,
+                            "quantity": qty,
+                            "lead_time_days": lead,
+                        }
 
-        market_dim = self.dim_market[["market_id", "region_id"]].copy()
-        records = []
+                        order_rows.append({
+                            k: v for k, v in order.items()
+                            if k != "arrival_day_idx"
+                        })
 
-        for row in self.regional_monthly_targets.itertuples(index=False):
-            markets = market_dim[
-                market_dim["region_id"] == row.region_id
-            ].reset_index(drop=True)
+                        on_order[pid] += qty
+                        scheduled_arrivals.setdefault(
+                            arrival_idx, []
+                        ).append(order)
 
-            if markets.empty:
-                if row.regional_monthly_target > 0:
-                    raise ValueError(
-                        f"Region {row.region_id!r} has positive supply "
-                        "but no markets."
+            # 4. Record daily inventory and validate conservation.
+            for pid in product_ids:
+                expected = opening[pid] + received[pid] - daily_sales[pid]
+
+                if stock[pid] != expected:
+                    raise AssertionError(
+                        f"Inventory conservation failed: "
+                        f"date={date}, product={product_names[pid]}, "
+                        f"opening={opening[pid]}, receipts={received[pid]}, "
+                        f"sales={daily_sales[pid]}, closing={stock[pid]}, "
+                        f"expected={expected}"
                     )
-                continue
 
-            market_ids = markets["market_id"].tolist()
-            configured = (
-                self.market_weights.get(row.region_id, {})
-                if self.market_weights is not None
-                else None
-            )
-            weights = self._weights_for_ids(
-                market_ids, configured, "market_weights"
-            )
-            targets = self._allocate_integer(
-                row.regional_monthly_target, weights
-            )
+                if stock[pid] < 0 or on_order[pid] < 0:
+                    raise AssertionError(
+                        f"Negative inventory or outstanding orders: "
+                        f"{date}, {product_names[pid]}"
+                    )
 
-            for market_id, target in zip(market_ids, targets):
-                records.append({
-                    "product_id": row.product_id,
-                    "year": int(row.year),
-                    "region_id": row.region_id,
-                    "market_id": market_id,
-                    "month": int(row.month),
-                    "market_monthly_target": int(target),
+                snapshot_rows.append({
+                    "date": date,
+                    "product_id": pid,
+                    "opening_stock": opening[pid],
+                    "arrivals_qty": received[pid],
+                    "demand_qty": daily_demand[pid],
+                    "sales_qty": daily_sales[pid],
+                    "lost_sales_qty": daily_lost[pid],
+                    "closing_stock": stock[pid],
+                    "on_order_qty": on_order[pid],
+                    "inventory_position": stock[pid] + on_order[pid],
                 })
 
-        result = pd.DataFrame(records)
-        self.market_targets = result
+            if day_idx < len(dates) - 1:
+                yield env.timeout(1)
 
-        # Every region-month's market ceilings must add up exactly.
-        parent = self.regional_monthly_targets.set_index(
-            ["product_id", "year", "region_id", "month"]
-        )["regional_monthly_target"]
-        child = (
-            result.groupby(["product_id", "year", "region_id", "month"])
-            ["market_monthly_target"].sum()
+    env.process(process_days())
+    env.run()
+
+    outputs = {
+        "sim_sales": pd.DataFrame(sales_rows),
+        "sim_stockout_events": pd.DataFrame(stockout_rows),
+        "sim_inventory_snapshot": pd.DataFrame(snapshot_rows),
+        "sim_purchase_orders": pd.DataFrame(order_rows),
+        "sim_delivery_events": pd.DataFrame(delivery_rows),
+        "sim_inventory_movements": pd.DataFrame(movement_rows),
+    }
+
+    # Final validations.
+    sales = outputs["sim_sales"]
+    snapshots = outputs["sim_inventory_snapshot"]
+
+    assert (sales["sales_qty"] <= sales["demand_qty"]).all()
+    assert (
+        sales["sales_qty"] + sales["lost_sales_qty"]
+        == sales["demand_qty"]
+    ).all()
+    assert snapshots["closing_stock"].ge(0).all()
+
+    daily_sales = (
+        sales.groupby(["date", "product_id"], as_index=False)
+        .agg(
+            demand_check=("demand_qty", "sum"),
+            sales_check=("sales_qty", "sum"),
+            lost_check=("lost_sales_qty", "sum"),
         )
+    )
+    reconciled = snapshots.merge(
+        daily_sales,
+        on=["date", "product_id"],
+        how="left",
+        validate="one_to_one",
+    )
 
-        if not child.reindex(parent.index, fill_value=0).equals(parent):
-            raise AssertionError(
-                "Market allocation does not conserve regional targets."
-            )
+    assert (reconciled["demand_qty"] == reconciled["demand_check"]).all()
+    assert (reconciled["sales_qty"] == reconciled["sales_check"]).all()
+    assert (
+        reconciled["lost_sales_qty"] == reconciled["lost_check"]
+    ).all()
 
-        return result.copy()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ---------------------------------------------------------------
-    # Stage 4: price-adjusted targets and transaction simulation
-    # ---------------------------------------------------------------
+    for name, frame in outputs.items():
+        frame.to_parquet(OUTPUT_DIR / f"{name}.parquet", index=False)
 
-    def _prepare_market_prices(self):
-        prices = self._price_table.copy()
+    metadata = {
+        "scenario_name": config["scenario_name"],
+        "seed": config["seed"],
+        "start_date": str(pd.Timestamp(dates[0]).date()),
+        "end_date": str(pd.Timestamp(dates[-1]).date()),
+        "demand_rows": len(demand),
+        "customers": int(demand["customer_id"].nunique()),
+        "products": int(demand["product_id"].nunique()),
+        "days": len(dates),
+        "total_demand": int(sales["demand_qty"].sum()),
+        "total_sales": int(sales["sales_qty"].sum()),
+        "total_lost_sales": int(sales["lost_sales_qty"].sum()),
+        "orders_placed": len(outputs["sim_purchase_orders"]),
+        "deliveries_received": len(outputs["sim_delivery_events"]),
+        "orders_outstanding_at_horizon": (
+            len(outputs["sim_purchase_orders"])
+            - outputs["sim_delivery_events"]["order_id"].nunique()
+        ),
+        "config": config,
+    }
 
-        # Use true market-level prices when available.
-        if "market_id" in prices.columns:
-            grouped = (
-                prices.groupby(
-                    ["product_id", "market_id", "year", "month"],
-                    as_index=False,
-                )["price"]
-                .median()
-                .rename(columns={"price": "market_price"})
-            )
-            join_keys = ["product_id", "market_id", "year", "month"]
-        else:
-            grouped = (
-                prices.groupby(["product_id", "year", "month"], as_index=False)
-                ["price"]
-                .median()
-                .rename(columns={"price": "market_price"})
-            )
-            join_keys = ["product_id", "year", "month"]
+    with (OUTPUT_DIR / "sim_run_metadata.json").open(
+        "w", encoding="utf-8"
+    ) as f:
+        json.dump(metadata, f, indent=2)
 
-        # Reference price per product. Used to make elasticity scale-stable.
-        reference = (
-            grouped.groupby("product_id", as_index=False)["market_price"]
-            .median()
-            .rename(columns={"market_price": "reference_price"})
-        )
-        self._price_join_keys = join_keys
-        self._product_reference_prices = reference
-        return grouped
+    print(f"Output directory: {OUTPUT_DIR.resolve()}")
+    print(f"Demand rows: {len(demand):,}")
+    print(f"Days: {len(dates)}")
+    print(f"Total demand: {metadata['total_demand']:,}")
+    print(f"Total fulfilled: {metadata['total_sales']:,}")
+    print(f"Total lost sales: {metadata['total_lost_sales']:,}")
+    print(f"Orders placed: {metadata['orders_placed']:,}")
+    print(f"Deliveries received: {metadata['deliveries_received']:,}")
+    print(
+        "Orders outstanding at horizon: "
+        f"{metadata['orders_outstanding_at_horizon']:,}"
+    )
+    print("Inventory and demand reconciliation checks passed.")
 
-    def stage_4_conditional_transaction_simulation(self):
-        if self.market_targets is None:
-            self.stage_3_market_disaggregation()
+    return outputs
 
-        prices = self._prepare_market_prices()
-        join_keys = self._price_join_keys
-
-        sim_base = self.market_targets.merge(
-            prices,
-            on=join_keys,
-            how="left",
-            validate="many_to_one",
-        )
-        sim_base = sim_base.merge(
-            self._product_reference_prices,
-            on="product_id",
-            how="left",
-            validate="many_to_one",
-        )
-
-        missing = sim_base["market_price"].isna()
-        # Explicit fallback: product's observed median across available
-        # markets/months. Do not invent a universal price such as 500.
-        sim_base.loc[missing, "market_price"] = sim_base.loc[
-            missing, "reference_price"
-        ]
-
-        if sim_base["market_price"].isna().any():
-            bad_products = sim_base.loc[
-                sim_base["market_price"].isna(), "product_id"
-            ].unique().tolist()
-            raise ValueError(
-                "No observed or imputable market price for products: "
-                f"{bad_products}"
-            )
-
-        if (sim_base["market_price"] <= 0).any():
-            raise ValueError("Prices must be positive.")
-
-        # The allocated market target is a ceiling. Adjust demand downward
-        # or upward relative to the product reference price, but never above
-        # the available market-level supply allocation.
-        ratio = (
-            sim_base["market_price"] / sim_base["reference_price"]
-        ).to_numpy(dtype=float)
-
-        demand_multiplier = np.power(ratio, self.price_elasticity)
-        demand_multiplier = np.clip(demand_multiplier, 0.0, 1.0)
-
-        sim_base["sales_target"] = np.floor(
-            sim_base["market_monthly_target"].to_numpy(dtype=float)
-            * demand_multiplier
-            + 1e-10
-        ).astype("int64")
-
-        self.sales_targets = sim_base[
-            [
-                "product_id", "year", "region_id", "market_id",
-                "month", "market_monthly_target", "sales_target",
-                "market_price", "reference_price",
-            ]
-        ].copy()
-
-        transactions = []
-
-        for row in sim_base.itertuples(index=False):
-            target_qty = int(row.sales_target)
-            if target_qty == 0:
-                continue
-
-            # Customers must belong to the actual market. Do not use OR
-            # logic that silently assigns customers from other markets.
-            eligible = self.dim_customer[
-                self.dim_customer["market_id"] == row.market_id
-            ]
-
-            if eligible.empty:
-                raise ValueError(
-                    f"Positive sales target {target_qty} for market "
-                    f"{row.market_id!r}, but no customers belong to it."
-                )
-
-            n_transactions = min(
-                target_qty,
-                max(
-                    1,
-                    int(round(
-                        target_qty / self.base_transactions_per_batch
-                    )),
-                ),
-            )
-
-            sampled = eligible.iloc[
-                self.rng.integers(0, len(eligible), size=n_transactions)
-            ].reset_index(drop=True)
-
-            # Draw negative-binomial provisional weights. Their parameters
-            # govern transaction-size heterogeneity; exact reconciliation
-            # below guarantees the aggregate target is not exceeded.
-            multipliers = sampled["customer_type"].map(
-                self.CHANNEL_MULTIPLIERS
-            ).fillna(1.0).to_numpy(dtype=float)
-
-            price_ratio = float(
-                row.market_price / row.reference_price
-            )
-            means = (
-                self.base_transaction_mean
-                * multipliers
-                * price_ratio ** self.price_elasticity
-            )
-            means = np.clip(means, 0.1, 1e6)
-
-            dispersion = 2.0
-            probabilities = dispersion / (dispersion + means)
-            raw_weights = self.rng.negative_binomial(
-                n=dispersion, p=probabilities
-            ).astype(float)
-
-            # Ensure positive weights, reserve one unit per transaction,
-            # then distribute the remaining integer target. This produces
-            # positive quantities summing EXACTLY to target_qty.
-            raw_weights = np.maximum(raw_weights, 1.0)
-            remaining = target_qty - n_transactions
-            extra = self.rng.multinomial(
-                remaining, raw_weights / raw_weights.sum()
-            )
-            quantities = extra + 1
-
-            assert int(quantities.sum()) == target_qty
-            assert (quantities > 0).all()
-
-            discount = (
-                sampled["customer_type"]
-                .map(self.DISCOUNTS)
-                .fillna(0.0)
-                .to_numpy(dtype=float)
-            )
-
-            unit_prices = (
-                float(row.market_price)
-                * self.rng.uniform(0.95, 1.05, size=n_transactions)
-            )
-
-            # First day of the month, YYYYMMDD. If you have dim_date,
-            # replace this with a validated date_id from that dimension.
-            date_id = int(f"{int(row.year):04d}{int(row.month):02d}01")
-
-            for i, cust in sampled.iterrows():
-                qty = int(quantities[i])
-                price = float(unit_prices[i])
-                disc = float(discount[i])
-
-                transactions.append({
-                    "customer_id": cust["customer_id"],
-                    "region_id": row.region_id,
-                    "market_id": row.market_id,
-                    "product_id": row.product_id,
-                    "date_id": date_id,
-                    "quantity": qty,
-                    "unit_price": price,
-                    "discount": disc,
-                    "revenue": qty * price * (1.0 - disc),
-                })
-
-        columns = [
-            "customer_id", "region_id", "market_id", "product_id",
-            "date_id", "quantity", "unit_price", "discount", "revenue",
-        ]
-        sales_df = pd.DataFrame(transactions, columns=columns)
-        return sales_df
-
-    # ---------------------------------------------------------------
-    # Stage 5: validate exact reconciliation and data integrity
-    # ---------------------------------------------------------------
-
-    def stage_5_validate_and_reconcile(self, sales_df: pd.DataFrame) -> bool:
-        if self.market_targets is None or self.sales_targets is None:
-            raise RuntimeError(
-                "Run Stage 4 before validating sales."
-            )
-
-        if sales_df.empty:
-            expected_positive = self.sales_targets["sales_target"].sum() > 0
-            if expected_positive:
-                raise AssertionError(
-                    "Sales are empty despite positive sales targets."
-                )
-
-        required = {
-            "customer_id", "region_id", "market_id", "product_id",
-            "date_id", "quantity", "unit_price", "discount", "revenue",
-        }
-        self._require_columns(sales_df, required, "sales_df")
-
-        if sales_df[list(required)].isna().any().any():
-            raise AssertionError("Sales contain missing required values.")
-
-        qty = pd.to_numeric(sales_df["quantity"], errors="coerce")
-        price = pd.to_numeric(sales_df["unit_price"], errors="coerce")
-        revenue = pd.to_numeric(sales_df["revenue"], errors="coerce")
-        discount = pd.to_numeric(sales_df["discount"], errors="coerce")
-
-        if not np.isfinite(qty).all() or (qty <= 0).any():
-            raise AssertionError("Quantities must be finite positive integers.")
-        if not np.equal(qty, np.floor(qty)).all():
-            raise AssertionError("Sales quantities must be integers.")
-        if not np.isfinite(price).all() or (price <= 0).any():
-            raise AssertionError("Unit prices must be finite and positive.")
-        if not np.isfinite(discount).all() or (
-            (discount < 0) | (discount >= 1)
-        ).any():
-            raise AssertionError("Discounts must be in [0, 1).")
-        if not np.isfinite(revenue).all() or (revenue < 0).any():
-            raise AssertionError("Revenue must be finite and nonnegative.")
-
-        expected_revenue = qty * price * (1.0 - discount)
-        if not np.allclose(
-            revenue.to_numpy(dtype=float),
-            expected_revenue.to_numpy(dtype=float),
-            rtol=1e-9,
-            atol=1e-7,
-        ):
-            raise AssertionError("Revenue does not match quantity, price and discount.")
-
-        customer_lookup = self.dim_customer[
-            ["customer_id", "market_id", "region_id"]
-        ]
-        checked = sales_df.merge(
-            customer_lookup,
-            on="customer_id",
-            how="left",
-            suffixes=("", "_customer"),
-            validate="many_to_one",
-            indicator=True,
-        )
-        if (checked["_merge"] != "both").any():
-            raise AssertionError("Sales contain unknown customer IDs.")
-        if (
-            (checked["market_id"] != checked["market_id_customer"])
-            | (checked["region_id"] != checked["region_id_customer"])
-        ).any():
-            raise AssertionError(
-                "Sales market/region does not match the sampled customer's location."
-            )
-
-        market_keys = [
-            "product_id", "year", "region_id", "market_id", "month"
-        ]
-
-        if not sales_df.empty:
-            years, months = self._year_month(
-                sales_df["date_id"], "sales_df.date_id"
-            )
-            checked_sales = sales_df.copy()
-            checked_sales["year"] = years.to_numpy()
-            checked_sales["month"] = months.to_numpy()
-            actual = (
-                checked_sales.groupby(market_keys, as_index=False)["quantity"]
-                .sum()
-                .rename(columns={"quantity": "actual_quantity"})
-            )
-        else:
-            actual = pd.DataFrame(
-                columns=market_keys + ["actual_quantity"]
-            )
-
-        expected = self.sales_targets[
-            market_keys + ["sales_target", "market_monthly_target"]
-        ].copy()
-
-        comparison = expected.merge(
-            actual,
-            on=market_keys,
-            how="left",
-            validate="one_to_one",
-        )
-        comparison["actual_quantity"] = (
-            comparison["actual_quantity"].fillna(0).astype("int64")
-        )
-
-        if not (
-            comparison["actual_quantity"].to_numpy()
-            == comparison["sales_target"].to_numpy()
-        ).all():
-            bad = comparison[
-                comparison["actual_quantity"] != comparison["sales_target"]
-            ].head(10)
-            raise AssertionError(
-                "Sales do not reconcile to price-adjusted market targets:\n"
-                + bad.to_string(index=False)
-            )
-
-        if (
-            comparison["actual_quantity"]
-            > comparison["market_monthly_target"]
-        ).any():
-            raise AssertionError("A market's sales exceed its supply ceiling.")
-
-        # Regional-monthly sales cannot exceed their allocated supply.
-        regional_actual = (
-            comparison.groupby(
-                ["product_id", "year", "region_id", "month"],
-                as_index=False,
-            )
-            .agg(actual_quantity=("actual_quantity", "sum"))
-        )
-        regional_caps = self.regional_monthly_targets.rename(
-            columns={"regional_monthly_target": "regional_cap"}
-        )
-        regional_check = regional_caps.merge(
-            regional_actual,
-            on=["product_id", "year", "region_id", "month"],
-            how="left",
-            validate="one_to_one",
-        )
-        regional_check["actual_quantity"] = (
-            regional_check["actual_quantity"].fillna(0)
-        )
-
-        if (
-            regional_check["actual_quantity"]
-            > regional_check["regional_cap"]
-        ).any():
-            raise AssertionError("Regional-monthly supply ceiling exceeded.")
-
-        # National annual sales cannot exceed the import-based cap.
-        annual_actual = (
-            comparison.assign(
-                year=comparison["year"].astype(int)
-            )
-            .groupby(["product_id", "year"], as_index=False)
-            .agg(actual_quantity=("actual_quantity", "sum"))
-        )
-        national_check = self.national_supply.merge(
-            annual_actual,
-            on=["product_id", "year"],
-            how="left",
-            validate="one_to_one",
-        )
-        national_check["actual_quantity"] = (
-            national_check["actual_quantity"].fillna(0)
-        )
-
-        if (
-            national_check["actual_quantity"]
-            > national_check["national_supply_cap"]
-        ).any():
-            raise AssertionError("National annual supply cap exceeded.")
-
-        print(
-            "Validation passed: exact sales-target reconciliation, "
-            "valid customer locations, valid financials, and no "
-            "market, regional or national supply-ceiling violations."
-        )
-        return True
-
-    def run(self):
-        """Execute the complete pipeline and return validated sales."""
-        self.stage_1_national_supply_bounds()
-        self.stage_2_regional_monthly_allocation()
-        self.stage_3_market_disaggregation()
-        sales = self.stage_4_conditional_transaction_simulation()
-        self.stage_5_validate_and_reconcile(sales)
-        return sales

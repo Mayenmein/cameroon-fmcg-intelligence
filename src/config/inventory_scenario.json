@@ -1,0 +1,78 @@
+{
+  "seed": 42,
+  "scenario_name": "baseline_synthetic_inventory",
+  "products": {
+    "bananas": {
+      "opening_stock": 50,
+      "reorder_point": 1271,
+      "order_up_to": 5287,
+      "lead_time_days": 2
+    },
+    "beans_fao": {
+      "opening_stock": 45,
+      "reorder_point": 1870,
+      "order_up_to": 5875,
+      "lead_time_days": 3
+    },
+    "cassava": {
+      "opening_stock": 55,
+      "reorder_point": 1485,
+      "order_up_to": 6141,
+      "lead_time_days": 2
+    },
+    "cocoyam_fao": {
+      "opening_stock": 45,
+      "reorder_point": 2186,
+      "order_up_to": 6870,
+      "lead_time_days": 3
+    },
+    "fish_mackerel": {
+      "opening_stock": 30,
+      "reorder_point": 2074,
+      "order_up_to": 5428,
+      "lead_time_days": 4
+    },
+    "maize": {
+      "opening_stock": 70,
+      "reorder_point": 1775,
+      "order_up_to": 7434,
+      "lead_time_days": 2
+    },
+    "meat_beef": {
+      "opening_stock": 30,
+      "reorder_point": 1615,
+      "order_up_to": 5025,
+      "lead_time_days": 3
+    },
+    "oil": {
+      "opening_stock": 45,
+      "reorder_point": 1152,
+      "order_up_to": 4708,
+      "lead_time_days": 2
+    },
+    "plantains_fao": {
+      "opening_stock": 50,
+      "reorder_point": 1270,
+      "order_up_to": 5234,
+      "lead_time_days": 2
+    },
+    "potatoes_fao": {
+      "opening_stock": 50,
+      "reorder_point": 2169,
+      "order_up_to": 6838,
+      "lead_time_days": 3
+    },
+    "rice": {
+      "opening_stock": 70,
+      "reorder_point": 1772,
+      "order_up_to": 7426,
+      "lead_time_days": 2
+    },
+    "wheat_flour": {
+      "opening_stock": 70,
+      "reorder_point": 2639,
+      "order_up_to": 8319,
+      "lead_time_days": 3
+    }
+  }
+}

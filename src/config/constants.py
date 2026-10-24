@@ -41,3 +41,39 @@ REGION_WEIGHTS = {
         9: 0.05,   # East
         10: 0.05,  # South
     }
+
+# Scenario assumptions, not measured Cameroon market statistics.
+CUSTOMER_BUY_PROB = {
+    "wholesaler": 0.30,
+    "supermarket": 0.35,
+    "retailer": 0.22,
+    "kiosk": 0.14,
+}
+
+CATEGORY_BUY_FACTOR = {
+    "staple": 1.15,
+    "protein": 0.85,
+    "fruit": 0.90,
+    "root": 0.95,
+    "legume": 0.90,
+    "oil": 0.90,
+    "other": 0.75,
+}
+
+# Average quantity per positive-demand day, before category adjustment.
+CUSTOMER_MEAN_QTY = {
+    "wholesaler": 10,
+    "supermarket": 5,
+    "retailer": 3,
+    "kiosk": 1,
+}
+
+CATEGORY_QTY_FACTOR = {
+    "staple": 1.00,
+    "protein": 0.80,
+    "fruit": 0.90,
+    "root": 1.00,
+    "legume": 0.90,
+    "oil": 0.80,
+    "other": 1.00,
+}

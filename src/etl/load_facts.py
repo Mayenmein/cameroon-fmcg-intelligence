@@ -21,8 +21,19 @@ def load_parquet(parquet_path, table_name, chunksize=5000):
 def main():
     build_fact_market_price()
     build_fact_trade()
-    load_parquet("data/processed/fact_market_price.parquet", "fact_market_price")
-    load_parquet("data/processed/fact_trade.parquet", "fact_trade")
+
+    load_parquet(
+        "data/processed/dim_wfp_market.parquet",
+        "dim_wfp_market",
+    )
+    load_parquet(
+        "data/processed/fact_market_price.parquet",
+        "fact_market_price",
+    )
+    load_parquet(
+        "data/processed/fact_trade.parquet",
+        "fact_trade",
+    )
 
 if __name__ == "__main__":
     main()
